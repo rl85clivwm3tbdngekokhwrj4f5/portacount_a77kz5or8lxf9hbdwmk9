@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -17,6 +18,10 @@
 #include <utility>
 #include <tuple>
 #include <atomic>
+#include <queue>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace
 {
@@ -199,6 +204,24 @@ namespace
     static InstanceData instance;
 
     static constexpr const char *const shared_memory_prefix = "/Portacount_vyjcicyipdclbkthgcrppallfevgbjkk";
+
+    struct MutexQueue
+    {
+        struct StringBuffer
+        {
+            size_t size;
+            char buf[300];
+        };
+        std::queue<StringBuffer, std::deque<StringBuffer>> string_queue;
+        std::mutex queue_mutex;
+    };
+    static MutexQueue mutex_string_queue;
+
+    struct ThreadInfo
+    {
+        std::atomic<bool> quit;
+    };
+    static ThreadInfo thread_info;
 
     static void reshape(const int width, const int height) 
     {
@@ -673,114 +696,163 @@ namespace
         glutSwapBuffers(); 
     }
 
+    static void read_serial_thread(void)
+    {
+        fd_set selector;
+        MutexQueue::StringBuffer input_buf;
+        char stringbuf[128];
+
+        for(;;)
+        {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if(thread_info.quit.load(std::memory_order_seq_cst) == true)
+            {
+                break;
+            }
+
+            ssize_t ret;
+            struct timespec time;
+            int str_len;
+
+            FD_ZERO(&selector);
+            FD_SET(fds.serial_fd, &selector);
+
+            timeval timeout = {0, 100000};
+            checkError2(select(fds.serial_fd + 1, &selector, NULL, NULL, &timeout), -1, "select error");
+            if(FD_ISSET(fds.serial_fd, &selector) )
+            {
+                memset(input_buf.buf, 0, sizeof(input_buf.buf));
+                ret = read(fds.serial_fd, input_buf.buf, sizeof(input_buf.buf) - 1);
+                checkError2(ret, -1L, "read error");
+                if(ret > 0)
+                {
+                    checkError(clock_gettime(CLOCK_MONOTONIC, &time), 0, "clock_gettime error");
+                    double timeval = static_cast<double>(time.tv_sec) + static_cast<double>(time.tv_nsec) * 0.000000001;
+                    memset(stringbuf, 0, sizeof(stringbuf));
+                    str_len = snprintf(stringbuf, sizeof(stringbuf) - 1, "%20.9f: ", timeval);
+                    static_assert(static_cast<int>(sizeof(stringbuf) - 1) == sizeof(stringbuf) - 1, "Size overflow"); 
+                    checkError3(str_len, static_cast<int>(sizeof(stringbuf) - 1), "snprintf error");
+                    printf("%s", input_buf.buf);
+                    writeFully(fds.outfile_fd, stringbuf, static_cast<size_t>(str_len) );
+                    writeFully(fds.outfile_fd, input_buf.buf, static_cast<size_t>(ret) );
+                    input_buf.size = static_cast<size_t>(ret);
+                    {
+                        const std::lock_guard<std::mutex> lock_mutex(mutex_string_queue.queue_mutex);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        mutex_string_queue.string_queue.push(input_buf);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                    }
+                }
+            }
+        }
+    }
+
     static void timer_func(const int value)
     {
         (void)value;
 
-        fd_set selector;
+        MutexQueue::StringBuffer input_buf;
+        bool has_input = false;
 
-        FD_ZERO(&selector);
-        FD_SET(fds.serial_fd, &selector);
-
-        timeval timeout = {0, 0};
-        checkError2(select(fds.serial_fd + 1, &selector, NULL, NULL, &timeout), -1, "select error");
-
-        char buf[300] = {0};
-        ssize_t ret;
-        if(FD_ISSET(fds.serial_fd, &selector) )
         {
-            ret = read(fds.serial_fd, buf, sizeof(buf) - 1);
-            checkError2(ret, -1L, "read error");
-            if(ret > 0)
+            const std::lock_guard<std::mutex> lock_mutex(mutex_string_queue.queue_mutex);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if(mutex_string_queue.string_queue.empty() == false)
             {
-                double val;
-                printf("%s", buf);
-                writeFully(fds.outfile_fd, buf, static_cast<size_t>(ret) );
-                if(mode == ModeType::COUNT_MODE)
-                {
-                    if(sscanf(buf, "Conc. %lf #/cc", &val) == 1)
-                    {
-                        if(val == 0.0)
-                        {
-                            // change 0.0 to 0.001 to avoid log(0)
-                            val = 0.001;
-                        }
-                        val = log10(val);
-                        count_mode_data.count_array.push_back(val);
-                        if(static_cast<double>(count_mode_data.count_array.size() ) > count_mode_data.count_mode_x_axis_max)
-                        {
-                            count_mode_data.count_mode_x_axis_max *= 2.0;
-                        }
-                        if(val < count_mode_data.count_array_min)
-                        {
-                            count_mode_data.count_array_min = val;
-                        }
-                        if(val > count_mode_data.count_array_max)
-                        {
-                            count_mode_data.count_array_max = val;
-                        }
-                    }
-                }
-                else if(mode == ModeType::FIT_TEST_MODE)
-                {
-                    if(sscanf(buf, "Mask %lf #/cc", &val) == 1)
-                    {
-                        val = log10(val);
-                        fit_test_mode_data.sample_array.push_back(val);
-                        if(static_cast<double>(fit_test_mode_data.sample_array.size() ) > fit_test_mode_data.fit_test_mode_x_axis_max)
-                        {
-                            fit_test_mode_data.fit_test_mode_x_axis_max *= 2.0;
-                        }
-                        if(val < fit_test_mode_data.sample_array_min)
-                        {
-                            fit_test_mode_data.sample_array_min = val;
-                        }
-                        if(val > fit_test_mode_data.sample_array_max)
-                        {
-                            fit_test_mode_data.sample_array_max = val;
-                        }
-                    }
-                    else if(sscanf(buf, "Ambient %lf #/cc", &val) == 1)
-                    {
-                        val = log10(val);
-                        fit_test_mode_data.ambient_array.push_back(val);
-                        if(static_cast<double>(fit_test_mode_data.ambient_array.size() ) > fit_test_mode_data.fit_test_mode_x_axis_max)
-                        {
-                            fit_test_mode_data.fit_test_mode_x_axis_max *= 2.0;
-                        }
-                        if(val < fit_test_mode_data.ambient_array_min)
-                        {
-                            fit_test_mode_data.ambient_array_min = val;
-                        }
-                        if(val > fit_test_mode_data.ambient_array_max)
-                        {
-                            fit_test_mode_data.ambient_array_max = val;
-                        }
-                    }
-                    else if(sscanf(buf, "FF %*u %lf PASS", &val) == 1 || sscanf(buf, "FF %*u %lf FAIL", &val) == 1)
-                    {
-                        val = log10(val);
-                        fit_test_mode_data.fit_factor_array.push_back(val);
-                        if(static_cast<double>(fit_test_mode_data.fit_factor_array.size() ) > fit_test_mode_data.fit_test_mode_x_axis_max)
-                        {
-                            fit_test_mode_data.fit_test_mode_x_axis_max *= 2.0;
-                        }
-                        if(val < fit_test_mode_data.fit_factor_array_min)
-                        {
-                            fit_test_mode_data.fit_factor_array_min = val;
-                        }
-                        if(val > fit_test_mode_data.fit_factor_array_max)
-                        {
-                            fit_test_mode_data.fit_factor_array_max = val;
-                        }
-                    }
-                }
-                // signal redraw
-                glutPostRedisplay();
+                input_buf = mutex_string_queue.string_queue.front();
+                mutex_string_queue.string_queue.pop();
+                has_input = true;
             }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
         }
 
-        glutTimerFunc(200, timer_func, 0);
+        if(has_input == true)
+        {
+            double val;
+            if(mode == ModeType::COUNT_MODE)
+            {
+                if(sscanf(input_buf.buf, "Conc. %lf #/cc", &val) == 1)
+                {
+                    if(val == 0.0)
+                    {
+                        // change 0.0 to 0.001 to avoid log(0)
+                        val = 0.001;
+                    }
+                    val = log10(val);
+                    count_mode_data.count_array.push_back(val);
+                    if(static_cast<double>(count_mode_data.count_array.size() ) > count_mode_data.count_mode_x_axis_max)
+                    {
+                        count_mode_data.count_mode_x_axis_max *= 2.0;
+                    }
+                    if(val < count_mode_data.count_array_min)
+                    {
+                        count_mode_data.count_array_min = val;
+                    }
+                    if(val > count_mode_data.count_array_max)
+                    {
+                        count_mode_data.count_array_max = val;
+                    }
+                }
+            }
+            else if(mode == ModeType::FIT_TEST_MODE)
+            {
+                if(sscanf(input_buf.buf, "Mask %lf #/cc", &val) == 1)
+                {
+                    val = log10(val);
+                    fit_test_mode_data.sample_array.push_back(val);
+                    if(static_cast<double>(fit_test_mode_data.sample_array.size() ) > fit_test_mode_data.fit_test_mode_x_axis_max)
+                    {
+                        fit_test_mode_data.fit_test_mode_x_axis_max *= 2.0;
+                    }
+                    if(val < fit_test_mode_data.sample_array_min)
+                    {
+                        fit_test_mode_data.sample_array_min = val;
+                    }
+                    if(val > fit_test_mode_data.sample_array_max)
+                    {
+                        fit_test_mode_data.sample_array_max = val;
+                    }
+                }
+                else if(sscanf(input_buf.buf, "Ambient %lf #/cc", &val) == 1)
+                {
+                    val = log10(val);
+                    fit_test_mode_data.ambient_array.push_back(val);
+                    if(static_cast<double>(fit_test_mode_data.ambient_array.size() ) > fit_test_mode_data.fit_test_mode_x_axis_max)
+                    {
+                        fit_test_mode_data.fit_test_mode_x_axis_max *= 2.0;
+                    }
+                    if(val < fit_test_mode_data.ambient_array_min)
+                    {
+                        fit_test_mode_data.ambient_array_min = val;
+                    }
+                    if(val > fit_test_mode_data.ambient_array_max)
+                    {
+                        fit_test_mode_data.ambient_array_max = val;
+                    }
+                }
+                else if(sscanf(input_buf.buf, "FF %*u %lf PASS", &val) == 1 || sscanf(input_buf.buf, "FF %*u %lf FAIL", &val) == 1)
+                {
+                    val = log10(val);
+                    fit_test_mode_data.fit_factor_array.push_back(val);
+                    if(static_cast<double>(fit_test_mode_data.fit_factor_array.size() ) > fit_test_mode_data.fit_test_mode_x_axis_max)
+                    {
+                        fit_test_mode_data.fit_test_mode_x_axis_max *= 2.0;
+                    }
+                    if(val < fit_test_mode_data.fit_factor_array_min)
+                    {
+                        fit_test_mode_data.fit_factor_array_min = val;
+                    }
+                    if(val > fit_test_mode_data.fit_factor_array_max)
+                    {
+                        fit_test_mode_data.fit_factor_array_max = val;
+                    }
+                }
+            }
+            // signal redraw
+            glutPostRedisplay();
+        }
+        
+        glutTimerFunc(100, timer_func, 0);
     }
 
     static void init_graphics(void)
@@ -806,7 +878,7 @@ namespace
         glutDisplayFunc(display);
         glutReshapeFunc(reshape);
         glutKeyboardFunc(keyboard_func);
-        glutTimerFunc(200, timer_func, 0);
+        glutTimerFunc(100, timer_func, 0);
     }
 
     static inline int open_shared_memory_object(const char *const name, const off_t length, const int oflag)
@@ -1099,7 +1171,13 @@ int main(int argc, char *argv[])
 
     init_graphics();
 
+    std::thread serial_thread(read_serial_thread);
+
     glutMainLoop();
+
+    atomic_test_and_set(thread_info.quit, false, true);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    serial_thread.join();
 
     checkError(close(fds.serial_fd), 0, "close error");
     checkError(close(fds.outfile_fd), 0, "close error");
